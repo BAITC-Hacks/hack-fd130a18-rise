@@ -1,0 +1,11 @@
+# Тема интерфейса TAŃDA (тёмная база нужна для полей формы)
+[theme]
+base = "dark"
+primaryColor = "#D8BD92"
+backgroundColor = "#151412"
+secondaryBackgroundColor = "#312D28"
+textColor = "#F4EFE7"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
