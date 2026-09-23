@@ -21,6 +21,7 @@ TAŃDA — интерфейс подбора подрядчиков (Streamlit).
     result.suggestions, result.season_note, result.meta
 """
 
+import asyncio
 import csv
 import html
 import sys
@@ -36,6 +37,10 @@ ROOT = UI_DIR.parent
 for p in (str(ROOT), str(UI_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
+
+from ai.parse_query import parse_user_query
+from ai.llm_client import error_message
+from ai.polish import polish_result
 
 IMPORT_NOTE = ""
 try:
@@ -188,6 +193,59 @@ def budget_typed():
         st.session_state.budget_preset = None
 
 
+def hours_value(label):
+    if not label or label == ANY:
+        return None
+    if label in HOURS:
+        return HOURS[label]
+    return float(str(label).removesuffix(" ч").replace(",", "."))
+
+
+def apply_text_query():
+    """Fill a fresh form before widgets render; the user reviews it before search."""
+    try:
+        with st.spinner("ИИ разбирает запрос…"):
+            parsed = asyncio.run(parse_user_query(st.session_state.get("request_text", "")))
+        event_date = date.fromisoformat(parsed.date) if parsed.date else None
+        if event_date and not DATE_MIN <= event_date <= DATE_MAX:
+            raise ValueError("Выберите дату с 23 сентября по 31 декабря 2026 года.")
+        if parsed.budget is not None and parsed.budget > 100_000_000:
+            raise ValueError("Максимальный бюджет в форме — 100 000 000 ₸.")
+        form = {
+            "event": next((name for name in EVENTS if name.casefold() == parsed.event_type), None),
+            "category": parsed.category,
+            "city": parsed.city,
+            "date": event_date,
+            "budget": parsed.budget,
+            "budget_preset": None,
+            "hours": f"{parsed.hours:g} ч" if parsed.hours is not None else ANY,
+            "lang": next((name for name, value in LANGUAGES.items() if value == parsed.language),
+                         parsed.language.capitalize() if parsed.language else ANY),
+        }
+        if not any(value is not None for value in parsed.model_dump().values()):
+            raise ValueError("Не удалось распознать параметры. Уточните запрос или заполните форму ниже.")
+    except (ValueError, TypeError) as error:
+        st.session_state.parse_error = "Не удалось распознать корректные параметры. Уточните запрос или заполните форму."
+        st.session_state.parse_notice = ""
+        return
+    except Exception as error:
+        st.session_state.parse_error = error_message(error)
+        st.session_state.parse_notice = ""
+        return
+
+    st.session_state.form = form
+    for key, value in form.items():
+        st.session_state[key] = value
+    st.session_state.show_all_cats = parsed.category not in POPULAR_CATEGORIES
+    st.session_state.tried = False
+    st.session_state.search_error = ""
+    st.session_state.parse_error = ""
+    st.session_state.parse_notice = (
+        "LLM разобрала запрос и перенесла параметры в форму. Проверьте их и заполните пропуски, "
+        "затем нажмите «Показать 3 лучших варианта». Дата без года относится к 2026 году."
+    )
+
+
 def missing_fields(form) -> dict:
     errors = {}
     if not form.get("event"):
@@ -200,7 +258,7 @@ def missing_fields(form) -> dict:
         errors["date"] = "Выберите дату"
     elif not (DATE_MIN <= form["date"] <= DATE_MAX):
         errors["date"] = "Календари подрядчиков доступны с 23 сентября по 31 декабря 2026"
-    if not form.get("budget"):
+    if form.get("budget") is None:
         errors["budget"] = "Укажите бюджет"
     return errors
 
@@ -212,8 +270,8 @@ def build_query(form) -> dict:
         "event_type": form["event"].lower(),
         "category": form["category"],
         "budget": int(form["budget"]),
-        "hours": HOURS.get(form.get("hours") or ANY),
-        "language": LANGUAGES.get(form.get("lang") or ANY),
+        "hours": hours_value(form.get("hours")),
+        "language": LANGUAGES.get(form.get("lang"), str(form.get("lang") or "").casefold() or None),
     }
 
 
@@ -225,6 +283,9 @@ def run_search(form):
     try:
         with st.spinner("Подбираем…"):
             result = recommend(query)
+        if result.get("cards"):
+            with st.spinner("ИИ пишет объяснения по фактам…"):
+                result = asyncio.run(polish_result(result, query))
     except Exception as err:  # показываем словами, а не красным экраном
         st.session_state.search_error = f"Не удалось получить подбор. Попробуйте ещё раз. ({type(err).__name__}: {err})"
         return False
@@ -335,7 +396,7 @@ def render_quiz():
     with st.container(key="quiz_panel"):
         step1 = bool(current.get("event") and current.get("category"))
         step2 = bool(current.get("city") and current.get("date"))
-        step3 = bool(current.get("budget"))
+        step3 = current.get("budget") is not None
         cur = 0 if not step1 else 1 if not step2 else 2
         progress = "".join(
             f'<div class="{"done " if done else ""}{"cur" if n == cur else ""}"><i></i>Шаг {n + 1} · {label}</div>'
@@ -343,6 +404,22 @@ def render_quiz():
         show('<div class="t"><div class="t-qhead"><h1>Уточним детали</h1>'
              '<p>Чем точнее параметры, тем конкретнее объяснения</p></div></div>'
              f'<div class="t"><div class="t-progress">{progress}</div></div>')
+
+        show('<div class="t"><div class="t-sect">Опишите мероприятие своими словами</div>'
+             '<p>Укажите город, дату, мероприятие, подрядчика и бюджет. '
+             'Язык и длительность — по желанию.</p></div>')
+        st.text_area(
+            "Запрос обычным текстом", key="request_text", height=110,
+            placeholder="Нужен ведущий на свадьбу в Алматы 7 октября, бюджет 1,2 млн, "
+                        "на 5 часов, на русском",
+            label_visibility="collapsed",
+        )
+        st.button("Разобрать запрос с ИИ", key="parse_request", on_click=apply_text_query)
+        st.caption("ИИ извлекает параметры. Перед поиском проверьте заполненную форму.")
+        if st.session_state.get("parse_error"):
+            show(f'<div class="t"><div class="t-err">{esc(st.session_state.parse_error)}</div></div>')
+        if st.session_state.get("parse_notice"):
+            show(f'<div class="t"><div class="t-picked">{esc(st.session_state.parse_notice)}</div></div>')
 
         show('<div class="t"><div class="t-sect" id="sect-event">Какое мероприятие</div></div>')
         st.pills("Какое мероприятие", list(EVENTS), key="event", required=True,
@@ -371,7 +448,10 @@ def render_quiz():
             value = current.get("city")
             show(f'<div class="t"><div class="t-fieldlabel">Город</div>'
                  f'<div class="t-fieldvalue{"" if value else " empty"}">{esc(value or "Не выбран")}</div></div>')
-            st.pills("Город", CITIES, key="city", required=True, label_visibility="collapsed")
+            city_options = list(CITIES)
+            if value and value not in city_options:
+                city_options.append(value)
+            st.pills("Город", city_options, key="city", required=True, label_visibility="collapsed")
             err("city")
         with c2, st.container(key="f_date"):
             value = current.get("date")
@@ -401,13 +481,19 @@ def render_quiz():
         with c4, st.container(key="f_hours"):
             value = current.get("hours") or ANY
             show(f'<div class="t"><div class="t-fieldlabel">Длительность, необязательно</div>'
-                 f'<div class="t-fieldvalue">{value if value == ANY else str(HOURS[value]) + " ч"}</div></div>')
-            st.pills("Длительность", list(HOURS), key="hours", required=True, label_visibility="collapsed")
+                 f'<div class="t-fieldvalue">{esc(value)}</div></div>')
+            hour_options = list(HOURS)
+            if value not in hour_options:
+                hour_options.insert(-1, value)
+            st.pills("Длительность", hour_options, key="hours", required=True, label_visibility="collapsed")
         with c5, st.container(key="f_lang"):
             value = current.get("lang") or ANY
             show(f'<div class="t"><div class="t-fieldlabel">Язык, необязательно</div>'
                  f'<div class="t-fieldvalue">{esc(value)}</div></div>')
-            st.pills("Язык", list(LANGUAGES), key="lang", required=True, label_visibility="collapsed")
+            language_options = list(LANGUAGES)
+            if value not in language_options:
+                language_options.insert(-1, value)
+            st.pills("Язык", language_options, key="lang", required=True, label_visibility="collapsed")
 
         submitted = st.button("Показать 3 лучших варианта", type="primary", key="submit",
                               icon=":material/arrow_forward:", icon_position="right", width="stretch")
@@ -461,17 +547,30 @@ def card_html(card: dict, rank: int, best: bool) -> str:
     meta = " · ".join(x for x in [cats, esc(card.get("city"))] if x)
     price = card.get("price")
     price_text = ("от " + money(price)) if isinstance(price, (int, float)) else esc(price or "Цена не указана")
-    items = as_list(card.get("availability")) + as_list(card.get("notes"))
     icon_color = ACCENT if best else INK_ICON
-    lis = "".join(f'<li>{svg("check", 18, icon_color, 2.2)}{esc(x)}</li>' for x in items)
+    available_color = "#9FDCB3" if best else "#216E39"
+    lis = "".join(
+        f'<li style="color:{available_color}">{svg("check", 18, available_color, 2.2)}{esc(x)}</li>'
+        for x in as_list(card.get("availability"))
+    )
+    lis += "".join(f'<li>{svg("info", 18, icon_color)}{esc(x)}</li>' for x in as_list(card.get("notes")))
     flags = ""
+    source = card.get("explanation_source")
+    if source in ("llm", "llm_cache"):
+        flags += '<span class="t-badge">Объяснение от ИИ' + (" · из кэша" if source == "llm_cache" else "") + '</span>'
+    elif source == "template":
+        flags += '<span class="t-badge warn">Объяснение по шаблону</span>'
     if card.get("synthetic"):
         flags += '<span class="t-badge syn">Синтетический профиль</span>'
+    elif "synthetic" in card:
+        flags += '<span class="t-badge">Реальный профиль</span>'
     if card.get("price_imputed"):
         flags += '<span class="t-badge warn">Цена оценочная — уточните</span>'
     if card.get("city_imputed"):
-        flags += '<span class="t-badge warn">Город проставлен при подготовке</span>'
+        flags += '<span class="t-badge warn">Город проставлен при подготовке — уточните</span>'
     facts = ""
+    if card.get("template_explanation"):
+        facts += f'<div><b>Исходные факты</b><br>{esc(card["template_explanation"])}</div>'
     for f in as_list(card.get("facts")):
         if isinstance(f, dict):
             facts += f'<div><b>{esc(f.get("fact"))}</b><br>«{esc(f.get("quote"))}»</div>'
@@ -479,17 +578,21 @@ def card_html(card: dict, rank: int, best: bool) -> str:
     if isinstance(parts, dict) and parts:
         rows = "<br>".join(f"{esc(k)}: {v:.2f}" if isinstance(v, (int, float)) else f"{esc(k)}: {esc(v)}"
                            for k, v in parts.items())
-        total = card.get("score")
-        total_text = f"<br><b>Итого: {total:.2f}</b>" if isinstance(total, (int, float)) else ""
-        facts += f"<div><b>Из чего сложился балл</b><br>{rows}{total_text}</div>"
+        facts += f"<div><b>Из чего сложился балл</b><br>{rows}</div>"
+    if card.get("score") is not None:
+        facts += f'<div><b>Итого: {esc(card["score"])}</b></div>'
+    if card.get("rank_reason"):
+        facts += f'<div><b>Почему это место</b><br>{esc(card["rank_reason"])}</div>'
     details = (f'<details><summary>На чём основано объяснение</summary><div class="facts">{facts}</div></details>'
                if facts else "")
     badge = '<span class="t-badge">Лучшее совпадение</span>' if best else ""
+    distinctive = f'<p class="expl"><strong>{esc(card["distinctive"])}</strong></p>' if card.get("distinctive") else ""
+    ai_notice = f'<p class="expl">{esc(card["ai_notice"])}</p>' if card.get("ai_notice") else ""
     return (f'<article class="t-card{" best" if best else ""}">'
             f'<div class="row"><span class="lab">Вариант {rank}</span>{badge}</div>'
             f'<div class="name">{esc(card.get("name"))}</div><div class="meta">{meta}</div>'
-            f'<div class="price">{price_text}</div><p class="expl">{esc(card.get("explanation"))}</p>'
-            f'<ul>{lis}</ul><div class="flags">{flags}</div><div class="grow"></div>{details}</article>')
+            f'<div class="price">{price_text}</div>{distinctive}<p class="expl">{esc(card.get("explanation"))}</p>'
+            f'<ul>{lis}</ul><div class="flags">{flags}</div>{ai_notice}<div class="grow"></div>{details}</article>')
 
 
 def funnel_numbers(funnel) -> str:
@@ -497,18 +600,40 @@ def funnel_numbers(funnel) -> str:
     for n, step in enumerate(funnel):
         if n:
             out.append(f'<div style="padding-top:8px">{svg("arrow", 18, TEXT_MUTED)}</div>')
-        out.append(f'<div><b>{esc(step.get("count"))}</b><span>{esc(step.get("label"))}</span></div>')
+        label = step.get("step") or step.get("label") or f"Шаг {n + 1}"
+        out.append(f'<div><b>{esc(step.get("count"))}</b><span>{esc(label)}</span></div>')
     return f'<div class="funnel">{"".join(out)}</div>'
 
 
 def funnel_bars(funnel) -> str:
     top = max([s.get("count") or 0 for s in funnel] + [1])
     rows = ""
-    for s in funnel:
+    for index, s in enumerate(funnel, start=1):
         n = s.get("count") or 0
         bar = f'<div class="bar" style="width:{max(4, round(n / top * 100))}%"></div>' if n else '<div class="bar zero"></div>'
-        rows += f'<div><span>{esc(s.get("label"))}</span>{bar}<b>{n}</b></div>'
+        label = s.get("step") or s.get("label") or f"Шаг {index}"
+        rows += f'<div><span>{esc(label)}</span>{bar}<b>{n}</b></div>'
     return f'<div class="t-bars">{rows}</div>'
+
+
+def render_rejected(result):
+    rejected = result.get("rejected") or []
+    if not rejected:
+        return
+    items = []
+    for profile in rejected:
+        reasons = []
+        for reason in profile.get("reasons") or []:
+            text = (reason.get("text") or reason.get("code")) if isinstance(reason, dict) else reason
+            if text:
+                reasons.append(f"<li>{esc(text)}</li>")
+        name = profile.get("name") or profile.get("id") or "Подрядчик"
+        items.append(f'<li style="margin:16px 0"><b>{esc(name)}</b><ul>{"".join(reasons)}</ul></li>')
+    opened = " open" if result.get("outcome") == "none_passed" else ""
+    show('<div class="t"><section class="t-results"><div class="t-box">'
+         f'<details{opened}><summary style="cursor:pointer;font-size:20px;font-weight:600">'
+         f'Почему не попали остальные ({len(rejected)})</summary>'
+         f'<ol>{"".join(items)}</ol></details></div></section></div>')
 
 
 def apply_suggestion(patch: dict):
@@ -581,6 +706,7 @@ def render_results():
                f'<div class="meta">{verified}<span>{time_text}</span></div></div>{funnel}{fallback}</div>')
         show(f'<div class="t">{banner}<section class="t-results">'
              f'<div class="t-grid3">{grid}</div>{near_html}{how}</section></div>')
+        render_rejected(result)
         return
 
     # ---- исходы no_category и none_passed
@@ -591,11 +717,7 @@ def render_results():
                   "text": "В декабре заняты 70–80% подрядчиков, на выходные почти никого не остаётся. "
                           "Это не ошибка поиска. Если дата гибкая, ноябрь даст больше выбора."}
     if outcome == "none_passed":
-        rejected = result.get("rejected") or []
-        who = "".join(f'<div><span><b>{esc(r.get("name"))}</b></span><span style="grid-column: span 2">'
-                      f'{esc("; ".join(x.get("text", "") for x in r.get("reasons") or []))}</span></div>'
-                      for r in rejected[:8])
-        body = funnel_bars(result["funnel"]) if result.get("funnel") else f'<div class="t-bars">{who}</div>'
+        body = funnel_bars(result["funnel"]) if result.get("funnel") else ""
         box = f'<div class="t-box"><h2>Где отсеялись кандидаты</h2><p>{esc(result.get("summary"))}</p>{body}</div>'
     else:
         box = f'<div class="t-box"><h2>Почему так</h2><p>{esc(result.get("summary"))}</p></div>'
@@ -624,6 +746,7 @@ def render_results():
             with mid:
                 st.button("Изменить параметры", type="primary", key="edit_bottom", on_click=go, args=("quiz",),
                           width="stretch")
+    render_rejected(result)
 
 
 # ================================================================= роутер
