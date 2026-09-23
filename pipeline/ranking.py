@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from math import inf
+import json
+from math import inf, sqrt
 from typing import Any, Iterable
 
 
@@ -161,3 +162,38 @@ def rank_profiles(
         )
     )
     return ranked
+
+
+def cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
+    """Return cosine similarity, or zero when a vector has no length."""
+    if len(vec1) != len(vec2):
+        raise ValueError("Векторы должны иметь одинаковую размерность.")
+
+    dot_product = sum(first * second for first, second in zip(vec1, vec2))
+    length1 = sqrt(sum(value * value for value in vec1))
+    length2 = sqrt(sum(value * value for value in vec2))
+    if length1 == 0 or length2 == 0:
+        return 0.0
+    return dot_product / (length1 * length2)
+
+
+def load_embeddings_from_file(
+    file_path: str = "data/embeddings.json",
+) -> dict[str, list[float]]:
+    """Read precomputed card vectors, or return an empty dict if absent."""
+    try:
+        with open(file_path, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        return {}
+
+
+def rank_cards_by_embedding(
+    query_vector: list[float], cards_embeddings: dict[str, list[float]]
+) -> list[tuple[str, float]]:
+    """Sort card IDs by descending similarity, breaking ties by ID."""
+    scores = [
+        (card_id, cosine_similarity(query_vector, vector))
+        for card_id, vector in cards_embeddings.items()
+    ]
+    return sorted(scores, key=lambda item: (-item[1], item[0]))
