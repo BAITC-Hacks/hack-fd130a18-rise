@@ -77,12 +77,23 @@ def _print_scenario(number: int, query: dict[str, Any], result: dict[str, Any]) 
     print(f"outcome: {result['outcome']}")
     print(f"headline: {result['headline']}")
     print(f"summary: {result['summary']}")
+    print("funnel:")
+    for step in result["funnel"]:
+        print(f"  - {step['step']}: {step['count']}")
 
     print("Карточки:")
     if result["cards"]:
         for card in result["cards"]:
             print(f"  - {card['name']} — балл {card['score']}")
             print(f"      score_parts: {card['score_parts']}")
+            print(f"      distinctive: {card['distinctive']}")
+            print(f"      rank_reason: {card['rank_reason']}")
+            print(f"      price_imputed: {card['price_imputed']}")
+            print(f"      city_imputed: {card['city_imputed']}")
+            print(f"      synthetic: {card['synthetic']}")
+            print(f"      explanation: {card['explanation']}")
+            print(f"      availability: {card['availability']}")
+            print(f"      notes: {card['notes']}")
     else:
         print("  (нет)")
 
